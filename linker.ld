@@ -1,0 +1,7 @@
+{
+    global:
+        mod_preinit;
+        mod_init;
+    local:
+        *;
+};
