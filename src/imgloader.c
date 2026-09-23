@@ -1,7 +1,6 @@
 /* imgloader.c
-Hooks mce::ImageUtils::loadImageFromMemory, when the buffer it is given doesn't start with some known image magic for some reason
-it swaps in a 'placeholder.png' before calling the originial, this also makes it so the annoying log "Image failed to load from memory"
-is gone, you have to drop a "placeholder.png" in the same folder as the mod tho, otherwise an embedded image is shown
+Hooks mce::ImageUtils::loadImageFromMemory it substitutes at the two known broken call sites inside LoadingScreen::frameUpdate which are found by scanning
+its bytes for `call loadImageFromMemory` and matching ret addr at runtime, every other call, any format passes through untouched
 */
 
 #define _GNU_SOURCE
@@ -98,13 +97,14 @@ static int find_mc_exec_range(void **base, size_t *size) {
 }
 //26.40 x86_64
 static const char *imgloader_sig = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 45 89 CE 4D 89 C5 48 89 CB 41 89 D7";
+static const char *frameupdate_sig = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 49 89 FE 64 48 8B 04 25 ? ? ? ? 48 89 45 ? 48 89 B5 ? ? ? ? 4C 8B 66";
 
 static uint8_t *fallback_bytes = NULL;
 static size_t fallback_length = 0;
 
 static void load_placeholder(void) {
     char path[4200];
-    snprintf(path, sizeof(path), "%s/placeholder.png", mod_dir()); // you may also change the name of the png here 
+    snprintf(path, sizeof(path), "%s/placeholder.png", mod_dir());
     FILE *f = fopen(path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END);
@@ -127,27 +127,45 @@ static const uint8_t *substitute(size_t *out_len) {
     return fallback;
 }
 
-static int has_valid_magic(const uint8_t *buf, uint64_t len) {
-    if (!buf || len < 4) return 0;
-    if (buf[0]==0x89 && buf[1]==0x50 && buf[2]==0x4E && buf[3]==0x47) return 1; // PNG
-    if (buf[0]==0xFF && buf[1]==0xD8 && buf[2]==0xFF) return 1;                 // JPEG
-    if (buf[0]==0x42 && buf[1]==0x4D) return 1;                                 // BMP
-    if (buf[0]==0x47 && buf[1]==0x49 && buf[2]==0x46 && buf[3]==0x38) return 1; // GIF8
-    if (buf[0]==0x38 && buf[1]==0x42 && buf[2]==0x50 && buf[3]==0x53) return 1; // 8BPS
-    if (buf[0]==0x00 && buf[1]==0x00 && (buf[2]==0x01 || buf[2]==0x02 || buf[2]==0x10)) return 1; /* TGA */
+//ret addre of loadImageFromMemory calls inside LoadingScreen::frameUpdate; 2 expected
+#define MAX_CALLSITES 2
+static void *loadscreen_callsites[MAX_CALLSITES];
+static int loadscreen_callsite_count = 0;
+
+static void find_loadscreen_callsites(const void *fn_start, size_t scan_window, const void *lm_addr) {
+    const uint8_t *p = (const uint8_t *)fn_start;
+    for (size_t i = 0; i + 5 <= scan_window && loadscreen_callsite_count < MAX_CALLSITES; i++) {
+        if (p[i] == 0xE8) { /*rel32 call*/
+            int32_t rel;
+            memcpy(&rel, &p[i + 1], 4);
+            const uint8_t *ret_addr = p + i + 5;
+            const uint8_t *tgt = ret_addr + rel;
+            if (tgt == (const uint8_t *)lm_addr) {
+                loadscreen_callsites[loadscreen_callsite_count++] = (void *)ret_addr;
+                mlog("found loading screen call site, return addr %p\n", (void *)ret_addr);
+            }
+        }
+    }
+}
+
+static int is_loadscreen_call(void) {
+    void *ret = __builtin_return_address(0);
+    for (int i = 0; i < loadscreen_callsite_count; i++)
+        if (loadscreen_callsites[i] == ret) return 1;
     return 0;
 }
-//
+
 typedef int64_t (*load_image_fn)(int64_t, int64_t, int, int64_t, uint64_t, char);
 static load_image_fn orig_load_image = NULL;
 
 static int64_t load_image_detour(int64_t a1, int64_t a2, int a3, int64_t a4, uint64_t a5, char a6) {
-    if (!has_valid_magic((const uint8_t *)a4, a5)) {
+    if (!orig_load_image) return 0;
+    if (is_loadscreen_call()) {
         size_t len = 0;
         const uint8_t *png = substitute(&len);
-        return orig_load_image ? orig_load_image(a1, a2, a3, (int64_t)png, (uint64_t)len, a6) : 0;
+        return orig_load_image(a1, a2, a3, (int64_t)png, (uint64_t)len, a6);
     }
-    return orig_load_image ? orig_load_image(a1, a2, a3, a4, a5, a6) : 0;
+    return orig_load_image(a1, a2, a3, a4, a5, a6);
 }
 
 extern __attribute__((visibility("default"))) void mod_preinit(void) {
@@ -172,6 +190,13 @@ extern __attribute__((visibility("default"))) void mod_init(void) {
         return;
     }
 
+    int16_t fu_pat[64];
+    int fu_patlen = parse_pattern(frameupdate_sig, fu_pat, 64);
+    void *fu_target = scan((const uint8_t *)base, size, fu_pat, fu_patlen);
+    if (fu_target) find_loadscreen_callsites(fu_target, 0x1000, target);
+    if (loadscreen_callsite_count == 0)
+        mlog("warning: no loading screen call sites resolved, hook will be a no-op\n");
+
     void *orig = NULL;
     hook_handle *h = hook_addr(target, (void *)load_image_detour, &orig, GPWN_X86_64_LONGHOOK);
     if (!h || !orig) {
@@ -179,5 +204,5 @@ extern __attribute__((visibility("default"))) void mod_init(void) {
         return;
     }
     orig_load_image = (load_image_fn)orig;
-    mlog("hooked loadImageFromMemory at %p\n", target);
+    mlog("hooked loadImageFromMemory at %p (%d loading screen call sites)\n", target, loadscreen_callsite_count);
 }
